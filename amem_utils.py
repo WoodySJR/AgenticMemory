@@ -1,6 +1,7 @@
 import json
 from tqdm import tqdm
 from openai import OpenAI
+from embedder import embedder
 from memory_layer import AgenticMemorySystem
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -148,14 +149,6 @@ def analyze_content(content, visual, model="gpt-4o-mini"):
                 "category": "Uncategorized",
                 "tags": []
             }
-
-
-def embedder(documents, model="text-embedding-3-small"):
-    # generate embeddings in parallel using multithreading
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = [executor.submit(client.embeddings.create, model=model, input=doc) for doc in documents]
-        responses = [future.result() for future in futures]
-    return [response.data[0].embedding for response in responses]
 
 
 def construct_memory(context, chunk_size, model_name = "gpt-4o-mini"):

@@ -15,7 +15,7 @@ import pickle
 from pathlib import Path
 from litellm import completion
 import time
-from amem_utils import embedder as embedding
+from embedder import embedder as embedding
 
 
 def simple_tokenize(text):
