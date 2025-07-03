@@ -15,6 +15,8 @@ import pickle
 from pathlib import Path
 from litellm import completion
 import time
+from amem_utils import embedder as embedding
+
 
 def simple_tokenize(text):
     return word_tokenize(text)
@@ -34,7 +36,7 @@ class OpenAIController(BaseLLMController):
                 api_key = os.getenv('OPENAI_API_KEY')
             if api_key is None:
                 raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
-            self.client = OpenAI(api_key=api_key)
+            self.client = OpenAI(api_key=api_key, base_url="http://123.129.219.111:3000/v1")
         except ImportError:
             raise ImportError("OpenAI package not found. Install it with: pip install openai")
     
@@ -47,8 +49,23 @@ class OpenAIController(BaseLLMController):
             ],
             response_format=response_format,
             temperature=temperature,
-            max_tokens=1000
+            max_tokens=2048
         )
+        print(response)
+        return response.choices[0].message.content
+
+    def get_completion_with_visual(self, prompt: str, image: str, response_format: dict, temperature: float = 0.7) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You must respond with a JSON object."},
+                {"role": "user", "content": [{"type":"text","text": prompt},{"type": "image_url","image_url": {"url": f"data:image/jpeg;base64,{image}"}}]},
+            ],
+            response_format=response_format,
+            temperature=temperature,
+            max_tokens=2048
+        )
+        print(response)
         return response.choices[0].message.content
 
 class OllamaController(BaseLLMController):
@@ -126,13 +143,22 @@ class MemoryNote:
                  evolution_history: Optional[List] = None,
                  category: Optional[str] = None,
                  tags: Optional[List[str]] = None,
-                 llm_controller: Optional[LLMController] = None):
+                 llm_controller: Optional[LLMController] = None, 
+                 visual: bool = False):
         
-        self.content = content
+        if visual:
+            self.content = "" # do not use base64 image for embedding
+            self.image = content
+        else:
+            self.content = content
+        self.visual = visual
         
         # Generate metadata using LLM if not provided and controller is available
         if llm_controller and any(param is None for param in [keywords, context, category, tags]):
-            analysis = self.analyze_content(content, llm_controller)
+            if visual:
+                analysis = self.analyze_content_with_visual(content, llm_controller)
+            else:
+                analysis = self.analyze_content(content, llm_controller)
             print("analysis", analysis)
             keywords = keywords or analysis["keywords"]
             context = context or analysis["context"]
@@ -233,6 +259,84 @@ class MemoryNote:
                 "category": "Uncategorized",
                 "tags": []
             }
+
+
+    @staticmethod
+    def analyze_content_with_visual(content: str, llm_controller: LLMController) -> Dict:            
+        """Analyze content to extract keywords, context, and other metadata"""
+        prompt = """Generate a structured analysis of the provided image (which is a page of a scientific paper) by:
+            1. Identifying the most salient keywords (focus on nouns, verbs, and key concepts)
+            2. Extracting core themes and contextual elements
+            3. Creating relevant categorical tags
+
+            Format the response as a JSON object:
+            {
+                "keywords": [
+                    // several specific, distinct keywords that capture key concepts and terminology
+                    // Order from most to least important
+                    // Don't include keywords that are the name of the speaker or time
+                    // At least three keywords, but don't be too redundant.
+                ],
+                "context": 
+                    // A summary of:
+                    // - Main topic/domain
+                    // - Key arguments/points
+                    // - Intended audience/purpose
+                    // - Detailed descriptions of visual elements within the image, such as tables and charts (including the index, such as Table 1, Figure 1, etc.)
+                ,
+                "tags": [
+                    // several broad categories/themes for classification
+                    // Include domain, format, and type tags
+                    // At least three tags, but don't be too redundant.
+                ]
+            }
+            """
+        try:
+            response = llm_controller.llm.get_completion_with_visual(prompt,content,response_format={"type": "json_schema", "json_schema": {
+                        "name": "response",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "keywords": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    }
+                                },
+                                "context": {
+                                    "type": "string",
+                                },
+                                "tags": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    }
+                                },
+                            },
+                            "required": ["keywords", "context", "tags"],
+                            "additionalProperties": False
+                        },
+                        "strict": True
+                }
+            })
+            
+            try:
+                analysis = json.loads(response)
+            except:
+                analysis = response
+            
+            return analysis
+            
+        except Exception as e:
+            print(f"Error analyzing content: {str(e)}")
+            print(f"Raw response: {response}")
+            return {
+                "keywords": [],
+                "context": "General",
+                "category": "Uncategorized",
+                "tags": []
+            }
+
 
 class HybridRetriever:
     """Hybrid retrieval system combining BM25 and semantic search."""
@@ -394,24 +498,29 @@ class SimpleEmbeddingRetriever:
         Args:
             model_name: Name of the SentenceTransformer model to use
         """
-        self.model = SentenceTransformer(model_name)
+        # self.model = SentenceTransformer(model_name)
         self.corpus = []
         self.embeddings = None
         self.document_ids = {}  # Map document content to its index
         
-    def add_documents(self, documents: List[str]):
+    def add_documents(self, documents: List[str], pre_embeddings):
         """Add documents to the retriever."""
         # Reset if no existing documents
         if not self.corpus:
             self.corpus = documents
             # print("documents", documents, len(documents))
-            self.embeddings = self.model.encode(documents)
+            # self.embeddings = self.model.encode(documents)
+            self.embeddings = embedding(documents)
             self.document_ids = {doc: idx for idx, doc in enumerate(documents)}
         else:
             # Append new documents
             start_idx = len(self.corpus)
             self.corpus.extend(documents)
-            new_embeddings = self.model.encode(documents)
+            # new_embeddings = self.model.encode(documents)
+            if pre_embeddings:
+                new_embeddings = pre_embeddings
+            else:
+                new_embeddings = embedding(documents)
             if self.embeddings is None:
                 self.embeddings = new_embeddings
             else:
@@ -433,8 +542,8 @@ class SimpleEmbeddingRetriever:
             return []
         # print("corpus", len(self.corpus), self.corpus)
         # Encode query
-        query_embedding = self.model.encode([query])[0]
-        
+        # query_embedding = self.model.encode([query])[0]
+        query_embedding = embedding([query])[0]
         # Calculate cosine similarities
         similarities = cosine_similarity([query_embedding], self.embeddings)[0]
         # Get top k results
@@ -542,15 +651,17 @@ class AgenticMemorySystem:
         self.evo_cnt = 0 
         self.evo_threshold = evo_threshold
 
-    def add_note(self, content: str, time: str = None, **kwargs) -> str:
+    def add_note(self, content: str, time: str = None, visual: bool = False, pre_embeddings=None, **kwargs) -> str:
         """Add a new memory note"""
-        note = MemoryNote(content=content, llm_controller=self.llm_controller, timestamp=time, **kwargs)
+        note = MemoryNote(content=content, llm_controller=self.llm_controller, timestamp=time, visual=visual, **kwargs)
         
         # Update retriever with all documents
         # all_docs = [m.content for m in self.memories.values()]
-        evo_label, note = self.process_memory(note)
+        # evo_label, note = self.process_memory(note) # disable evolution
+        evo_label = False
+
         self.memories[note.id] = note
-        self.retriever.add_documents([note.context + " keywords: " + ", ".join(note.keywords)])
+        self.retriever.add_documents([note.context + " keywords: " + ", ".join(note.keywords)], pre_embeddings)
         if evo_label == True:
             self.evo_cnt += 1
             if self.evo_cnt % self.evo_threshold == 0:
@@ -583,94 +694,99 @@ class AgenticMemorySystem:
     
     def process_memory(self, note: MemoryNote) -> bool:
         """Process a memory note and return an evolution label"""
-        neighbor_memory, indices = self.find_related_memories(note.content, k=5)
-        prompt_memory = self.evolution_system_prompt.format(context=note.context, content=note.content, keywords=note.keywords, nearest_neighbors_memories=neighbor_memory,neighbor_number=len(indices))
-        print("prompt_memory", prompt_memory)
-        response = self.llm_controller.llm.get_completion(
-            prompt_memory,response_format={"type": "json_schema", "json_schema": {
-                        "name": "response",
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "should_evolve": {
-                                    "type": "boolean",
-                                },
-                                "actions": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                },
-                                "suggested_connections": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "integer"
-                                    }
-                                },
-                                "new_context_neighborhood": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                },
-                                "tags_to_update": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                },
-                                "new_tags_neighborhood": {
-                                    "type": "array",
-                                    "items": {
+        try: 
+            neighbor_memory, indices = self.find_related_memories(note.content, k=5)
+            prompt_memory = self.evolution_system_prompt.format(context=note.context, content=note.content, keywords=note.keywords, nearest_neighbors_memories=neighbor_memory,neighbor_number=len(indices))
+            # print("prompt_memory", prompt_memory)
+            response = self.llm_controller.llm.get_completion(
+                prompt_memory,response_format={"type": "json_schema", "json_schema": {
+                            "name": "response",
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "should_evolve": {
+                                        "type": "boolean",
+                                    },
+                                    "actions": {
                                         "type": "array",
                                         "items": {
                                             "type": "string"
                                         }
+                                    },
+                                    "suggested_connections": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "integer"
+                                        }
+                                    },
+                                    "new_context_neighborhood": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string"
+                                        }
+                                    },
+                                    "tags_to_update": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string"
+                                        }
+                                    },
+                                    "new_tags_neighborhood": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "string"
+                                            }
+                                        }
                                     }
-                                }
+                                },
+                                "required": ["should_evolve","actions","suggested_connections","tags_to_update","new_context_neighborhood","new_tags_neighborhood"],
+                                "additionalProperties": False
                             },
-                            "required": ["should_evolve","actions","suggested_connections","tags_to_update","new_context_neighborhood","new_tags_neighborhood"],
-                            "additionalProperties": False
-                        },
-                        "strict": True
-                    }}
-        )
-        # try:
-        # print("response", response, type(response))
-        response_json = json.loads(response)
-        print("response_json", response_json, type(response_json))
-        # except:
-        #     response_json = response
-        should_evolve = response_json["should_evolve"]
-        if should_evolve:
-            actions = response_json["actions"]
-            for action in actions:
-                if action == "strengthen":
-                    suggest_connections = response_json["suggested_connections"]
-                    new_tags = response_json["tags_to_update"]
-                    note.links.extend(suggest_connections)
-                    note.tags = new_tags
-                elif action == "update_neighbor":
-                    new_context_neighborhood = response_json["new_context_neighborhood"]
-                    new_tags_neighborhood = response_json["new_tags_neighborhood"]
-                    noteslist = list(self.memories.values())
-                    notes_id = list(self.memories.keys())
-                    print("indices", indices)
-                    # if slms output less than the number of neighbors, use the sequential order of new tags and context.
-                    for i in range(min(len(indices), len(new_tags_neighborhood))):
-                        # find some memory
-                        tag = new_tags_neighborhood[i]
-                        if i < len(new_context_neighborhood):
-                            context = new_context_neighborhood[i]
-                        else:
-                            context = noteslist[indices[i]].context
-                        memorytmp_idx = indices[i]
-                        notetmp = noteslist[memorytmp_idx]
-                        # add tag to memory
-                        notetmp.tags = tag
-                        notetmp.context = context
-                        self.memories[notes_id[memorytmp_idx]] = notetmp
-        return should_evolve,note
+                            "strict": True
+                        }}
+            )
+            # try:
+            # print("response", response, type(response))
+            response_json = json.loads(response)
+            # print("response_json", response_json, type(response_json))
+            # except:
+            #     response_json = response
+            should_evolve = response_json["should_evolve"]
+            if should_evolve:
+                actions = response_json["actions"]
+                for action in actions:
+                    if action == "strengthen":
+                        suggest_connections = response_json["suggested_connections"]
+                        new_tags = response_json["tags_to_update"]
+                        note.links.extend(suggest_connections)
+                        note.tags = new_tags
+                    elif action == "update_neighbor":
+                        new_context_neighborhood = response_json["new_context_neighborhood"]
+                        new_tags_neighborhood = response_json["new_tags_neighborhood"]
+                        noteslist = list(self.memories.values())
+                        notes_id = list(self.memories.keys())
+                        print("indices", indices)
+                        # if slms output less than the number of neighbors, use the sequential order of new tags and context.
+                        for i in range(min(len(indices), len(new_tags_neighborhood))):
+                            # find some memory
+                            tag = new_tags_neighborhood[i]
+                            if i < len(new_context_neighborhood):
+                                context = new_context_neighborhood[i]
+                            else:
+                                context = noteslist[indices[i]].context
+                            memorytmp_idx = indices[i]
+                            notetmp = noteslist[memorytmp_idx]
+                            # add tag to memory
+                            notetmp.tags = tag
+                            notetmp.context = context
+                            self.memories[notes_id[memorytmp_idx]] = notetmp
+            return should_evolve,note
+        
+        except Exception as e:
+            # For testing purposes, catch all exceptions and return the original note
+            return False, note
 
     def find_related_memories(self, query: str, k: int = 5) -> List[MemoryNote]:
         """Find related memories using hybrid retrieval"""
@@ -712,6 +828,38 @@ class AgenticMemorySystem:
                     break
                 j += 1
         return memory_str
+
+    def find_related_notes(self, query: str, k: int = 5) -> List[MemoryNote]:
+        """Find related memories using hybrid retrieval"""
+        if not self.memories:
+            return []
+            
+        # Get indices of related memories
+        # indices = self.retriever.retrieve(query_note.content, k)
+        indices = self.retriever.search(query, k)
+        
+        # Convert to list of memories
+        all_memories = list(self.memories.values())
+        memory_str = ""
+        notes = []
+        j = 0
+        for i in indices:
+            memory_str +=  "talk start time:" + all_memories[i].timestamp + "memory content: " + all_memories[i].content + "memory context: " + all_memories[i].context + "memory keywords: " + str(all_memories[i].keywords) + "memory tags: " + str(all_memories[i].tags) + "\n"
+            if all_memories[i] not in notes:
+                notes.append(all_memories[i])
+            j += 1
+            if j >=k:
+                return notes
+            neighborhood = all_memories[i].links
+            for neighbor in neighborhood:
+                memory_str += "talk start time:" + all_memories[neighbor].timestamp + "memory content: " + all_memories[neighbor].content + "memory context: " + all_memories[neighbor].context + "memory keywords: " + str(all_memories[neighbor].keywords) + "memory tags: " + str(all_memories[neighbor].tags) + "\n"
+                if all_memories[neighbor] not in notes:
+                    notes.append(all_memories[neighbor])
+                j += 1
+                if j >=k:
+                    return notes
+                    #break
+        return notes
 
 def run_tests():
     """Run system tests"""
